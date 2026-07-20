@@ -1,0 +1,454 @@
+#!/bin/bash
+# 128 机 MUSA 预训练正式交付脚本（1024 卡，对齐 cuda_pretrain.sh）
+#
+# 并行: TP=2 + SP, PP=8, EP=64, GLOBAL_BATCH=NNODES×128（128 机 → 16384）, seq=4096
+# 模型: 61 层 MoE+MLA；暂不能对齐的 cuda flag 见注释与 docs/musa_cuda_adaptation_issues.md
+#
+# 启动（auto_fault_manager --worldsize 128 已默认本入口，无需再 export ENTRY）:
+#   LOG_NAME=ws128_YYYYMMDD bash auto_fault_manager.sh --hostfile ../hostfile.runtime.128 --worldsize 128 ...
+#
+# 双机缩小验证请用 musa_pretrain_ws2.sh，勿用本脚本。
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOSTFILE="${HOSTFILE:-${SCRIPT_DIR}/hostfile}"
+
+# ---------------------------------------------------------------------------
+# hostfile → 集群拓扑（128 机：NNODES=128，由 hostfile / dist_run 注入）
+# ---------------------------------------------------------------------------
+if [ ! -f "${HOSTFILE}" ]; then
+    echo "ERROR: hostfile 不存在: ${HOSTFILE}" >&2
+    exit 1
+fi
+
+mapfile -t HOSTS < <(grep -v '^[[:space:]]*#' "${HOSTFILE}" | awk '{print $1}' | grep -v '^$')
+NNODES=${NNODES:-${#HOSTS[@]}}
+if [ "${NNODES}" -lt 1 ]; then
+    echo "ERROR: hostfile 无有效节点: ${HOSTFILE}" >&2
+    exit 1
+fi
+
+MASTER_ADDR=${MASTER_ADDR:-${HOSTS[0]}}
+# 原 cuda_pretrain.sh: MASTER_PORT=22
+# 现: 29500 — torchrun 分布式 rendezvous 端口，22 为 SSH 端口无法用于 NCCL/MCCL 建联
+MASTER_PORT=${MASTER_PORT:-29500}
+
+LOCAL_IP=$(ip -4 -o addr show bond0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+NODE_RANK=${RANK:-${NODE_RANK:-}}
+if [ -z "${NODE_RANK}" ]; then
+    rank=0
+    for ip in "${HOSTS[@]}"; do
+        if [ "${ip}" = "${LOCAL_IP}" ]; then
+            NODE_RANK=${rank}
+            break
+        fi
+        rank=$((rank + 1))
+    done
+fi
+if [ -z "${NODE_RANK}" ] || [ "${NODE_RANK}" -ge "${NNODES}" ]; then
+    echo "ERROR: 无法确定 NODE_RANK (LOCAL_IP=${LOCAL_IP}, hostfile=${HOSTFILE})" >&2
+    exit 1
+fi
+
+export GPUS_PER_NODE=${GPUS_PER_NODE:-8}   # 原: 8（不变）
+export GPU_NUM=$((${GPUS_PER_NODE} * ${NNODES}))
+export WORLD_SIZE=$((${GPUS_PER_NODE} * ${NNODES}))
+export NODE_RANK MASTER_ADDR MASTER_PORT NNODES
+
+# ---------------------------------------------------------------------------
+# 环境变量（cuda_pretrain.sh → MUSA/MCCL 映射）
+# ---------------------------------------------------------------------------
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
+export LD_LIBRARY_PATH=/usr/local/musa/lib:${LD_LIBRARY_PATH:-}
+export MUSA_HOME=${MUSA_HOME:-/usr/local/musa}
+export MUSA_VISIBLE_DEVICES=${MUSA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+export MUSA_KERNEL_TIMEOUT=${MUSA_KERNEL_TIMEOUT:-3200000}
+export MUSA_BLOCK_SCHEDULE_MODE=${MUSA_BLOCK_SCHEDULE_MODE:-1}
+export ACCELERATOR_BACKEND="musa"
+
+# MCCL — JoyVideo /mnt/code/0407/XVideo/scripts/dist_train.sh 对齐（128 机千卡）
+# bond0 socket 建联；不设 IB_HCA / CROSS_NIC / RoCE ens*
+export MCCL_SOCKET_IFNAME=${MCCL_SOCKET_IFNAME:-bond0}
+export MCCL_PROTOS=${MCCL_PROTOS:-2}
+export MCCL_ALGOS=${MCCL_ALGOS:-1}
+export MCCL_CHECK_POINTERS=${MCCL_CHECK_POINTERS:-0}
+export MCCL_IB_GID_INDEX=${MCCL_IB_GID_INDEX:-3}
+export MCCL_IB_TC=${MCCL_IB_TC:-122}
+export MCCL_BUFFSIZE=${MCCL_BUFFSIZE:-20971520}
+export MCCL_IB_TIMEOUT=${MCCL_IB_TIMEOUT:-19}
+export MCCL_IB_RETRY_CNT=${MCCL_IB_RETRY_CNT:-7}
+export MCCL_NET_SHARED_BUFFERS=${MCCL_NET_SHARED_BUFFERS:-0}
+export MCCL_DEBUG=${MCCL_DEBUG:-WARN}
+
+# 原 cuda: CUDA_DEVICE_MAX_CONNECTIONS=32
+# 现: 1 — Megatron 在使用 TP/CP 时要求此值为 1（JoyVideo: MUSA_DEVICE_MAX_CONNECTIONS=1）
+export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
+export MUSA_DEVICE_MAX_CONNECTIONS=${MUSA_DEVICE_MAX_CONNECTIONS:-1}
+
+export PYTORCH_MUSA_ALLOC_CONF=${PYTORCH_MUSA_ALLOC_CONF:-"expandable_segments:True"}  # 原: PYTORCH_CUDA_ALLOC_CONF
+export TORCH_MCCL_AVOID_RECORD_STREAMS=${TORCH_MCCL_AVOID_RECORD_STREAMS:-1}
+export TORCH_MCCL_TRACE_BUFFER_SIZE=${TORCH_MCCL_TRACE_BUFFER_SIZE:-1000000}  # 原: TORCH_NCCL_TRACE_BUFFER_SIZE
+
+export NVTE_FWD_LAYERNORM_SM_MARGIN=${NVTE_FWD_LAYERNORM_SM_MARGIN:-8}   # 原: 8
+export NVTE_BWD_LAYERNORM_SM_MARGIN=${NVTE_BWD_LAYERNORM_SM_MARGIN:-8}   # 原: 8
+export NVTE_DP_AMAX_REDUCE_INTERVAL=${NVTE_DP_AMAX_REDUCE_INTERVAL:-0}   # 原: 0
+export NVTE_ALLOW_NONDETERMINISTIC_ALGO=${NVTE_ALLOW_NONDETERMINISTIC_ALGO:-1}  # 原: 1
+export NVTE_FUSED_ATTN=${NVTE_FUSED_ATTN:-0}                           # 原: 0
+export NVTE_FLASH_ATTN=${NVTE_FLASH_ATTN:-1}                           # 原: 1
+export NVTE_EXT_MARGIN_SM=${NVTE_EXT_MARGIN_SM:-20}                    # 原: 20
+export NVTE_DEBUG=${NVTE_DEBUG:-0}                                     # 原: 1；验证时降为 0 减少日志
+export NVTE_DEBUG_LEVEL=${NVTE_DEBUG_LEVEL:-0}                         # 原: 2
+# 原 cuda: NVTE_NORM_*_USE_CUDNN / CUDNN_LOG* — MUSA 无 cuDNN，省略
+
+export USE_MUSA_MOE=${USE_MUSA_MOE:-1}                                 # 原 cuda 无，musa_pretrain 新增
+export USE_DEEPEP_ACE=${USE_DEEPEP_ACE:-0}                             # 原 musa_pretrain: 1；alltoall 模式下关闭
+export USE_RECOMPUTE_VARIANCE=${USE_RECOMPUTE_VARIANCE:-0}
+export ENABLE_D2H_IN_PERMUTATION=${ENABLE_D2H_IN_PERMUTATION:-0}
+export NO_LOSS_REDUCE=${NO_LOSS_REDUCE:-1}                             # 原 cuda: 0；MUSA patch loss 上报格式不兼容标量写入
+
+# ---------------------------------------------------------------------------
+# 代码路径（对齐 cuda_pretrain.sh：固定 MCORE_PATH + pretrain_gpt.py，禁止 env 覆盖）
+# cuda:  MCORE_PATH=/mnt/workspace/jdcloud/Megatron-LM
+#        torchrun ... ${MCORE_PATH}/pretrain_gpt.py
+# musa:  同路径语义固定为容器内 /home/Megatron-LM/pretrain_gpt.py；
+#        仍经 LAUNCHER 先注入 musa_patch（MUSA 必需），再 runpy 到该入口。
+# ---------------------------------------------------------------------------
+MCORE_PATH=/home/Megatron-LM
+PATCH_HOME=/home/megatron-lm-musa-patch
+LAUNCHER=${SCRIPT_DIR}/pretrain_gpt_musa_launcher.py
+PRETRAIN_SCRIPT=${MCORE_PATH}/pretrain_gpt.py
+export MCORE_PATH
+export PRETRAIN_SCRIPT
+export PYTHONPATH=${MCORE_PATH}:${PATCH_HOME}:${PYTHONPATH:-}
+
+if [ ! -d "${MCORE_PATH}/build" ]; then
+    pushd "${MCORE_PATH}" >/dev/null
+    python setup.py build_ext --inplace
+    popd >/dev/null
+fi
+
+# ---------------------------------------------------------------------------
+# 并行策略（对齐 cuda_pretrain.sh；128×8=1024 = 2×8×1×64×1）
+# A-006 已修 SP arity；2026-07-13 128×10 step 验证通过 → 默认改回 TP=2 + SP
+# 前置：节点 /home/megatron-lm-musa-patch/.../linear_with_grad_...py SP return 须为 9 元组
+# ---------------------------------------------------------------------------
+TP=2
+PP=8
+CP=1
+EP=64
+MTP_LAYERS=0
+MTP_LOSS=0.1
+ENABLE_SEQUENCE_PARALLEL=${ENABLE_SEQUENCE_PARALLEL:-1}
+# cuda LAYOUT Et|(tt|)*30L：128 全宽挂死（A-004），生产用 decoder-first/last 7+6
+
+# ---------------------------------------------------------------------------
+# 训练超参（与 cuda_pretrain.sh 对齐，可通过环境变量覆盖）
+# ---------------------------------------------------------------------------
+MICRO_BATCH=1
+GLOBAL_BATCH=${GLOBAL_BATCH:-$((NNODES * 128))}
+SEQ_LENGTH=${SEQ_LENGTH:-4096}                                         # 对齐 cuda / g2_128
+RECOMPUTE_GRANULARITY=${RECOMPUTE_GRANULARITY:-full}                   # cuda 无；MUSA seq4096 必需
+RECOMPUTE_METHOD=${RECOMPUTE_METHOD:-uniform}
+RECOMPUTE_NUM_LAYERS=${RECOMPUTE_NUM_LAYERS:-1}
+DECAY_STEPS=100000
+TRAINING_STEPS=${TRAINING_STEPS:-100000}
+SAVE_INTERVAL=100000
+LR_WARMUP_INIT=0.0
+WARMUP_STEPS=1000
+LR=2e-4
+LR_MIN=2e-5
+DECAY_STYLE=cosine
+ADAM_BETA1=0.9
+ADAM_BETA2=0.95
+LB_RATE=1e-4
+RB_RATE=1e-3
+INIT_STD=0.006
+
+# ---------------------------------------------------------------------------
+# 数据 / 输出路径（RUN_NAME 来自 LOG_NAME，避免 cache/ckpt 互相覆盖）
+# ---------------------------------------------------------------------------
+BASE=/mnt/code/llm_pretrain
+RUN_NAME=${LOG_NAME:-"ws128-$(date +%Y%m%d_%H%M%S)"}
+TOKENIZER_PATH=${TOKENIZER_PATH:-${BASE}/tokenizer}
+SAVE_PATH=${SAVE_PATH:-/home/jd/wangkang/llm_pretrain/outputs}
+LOG_OUTPUT=${LOG_OUTPUT:-/home/jd/wangkang/llm_pretrain/outputs/logs}
+DATA_PATH=${DATA_PATH:-/home/jd/wangkang/llm_pretrain/data/tkn_ds_the_pile}
+
+# ---------------------------------------------------------------------------
+# 模型结构（MoE + MLA，对齐 cuda_pretrain.sh；MUSA 暂不能启用的 flag 见行内注释）
+# ---------------------------------------------------------------------------
+ADD_NETWORK_SIZE_ARGS=(
+    --decoder-first-pipeline-num-layers 7
+    --decoder-last-pipeline-num-layers 6
+    --recompute-granularity ${RECOMPUTE_GRANULARITY}
+    --recompute-method ${RECOMPUTE_METHOD}
+    --recompute-num-layers ${RECOMPUTE_NUM_LAYERS}
+    --num-layers 61
+    --hidden-size 7168
+    --ffn-hidden-size 18432
+    --num-attention-heads 128
+    --kv-channels 128
+    --position-embedding-type rope
+    --rotary-base 10000
+    --rotary-percent 1.0
+    --rope-type rope
+    --make-vocab-size-divisible-by 3232
+    --normalization RMSNorm
+    --norm-epsilon 1e-6
+    --swiglu
+    --untie-embeddings-and-output-weights
+    --multi-latent-attention
+    --attention-dropout 0.0
+    --hidden-dropout 0.0
+    --clip-grad 1.0
+    --weight-decay 0.1
+    --qk-layernorm
+    --num-experts 256
+    --manual-gc
+    --manual-gc-interval 5
+    --moe-layer-freq "([0]*3+[1]*58)"
+    --moe-ffn-hidden-size 2048
+    --moe-shared-expert-intermediate-size 2048
+    --moe-router-load-balancing-type seq_aux_loss
+    --moe-router-topk 8
+    --moe-router-pre-softmax
+    --moe-grouped-gemm
+    --moe-router-group-topk 4
+    --moe-router-num-groups 8
+    --moe-router-topk-scaling-factor 2.5
+    --moe-router-score-function sigmoid
+    --moe-router-enable-expert-bias
+    --q-lora-rank 1536
+    --kv-lora-rank 512
+    --qk-head-dim 128
+    --qk-pos-emb-head-dim 64
+    --v-head-dim 128
+    --init-method-std ${INIT_STD}
+    --attention-backend flash
+    --disable-bias-linear
+    --moe-router-dtype fp32
+    --transformer-impl transformer_engine
+    --use-flash-attn
+    --no-rope-fusion
+    --cross-entropy-loss-fusion
+    --cross-entropy-fusion-impl native
+    --moe-permute-fusion
+    --moe-token-dispatcher-type alltoall
+    --moe-router-force-load-balancing
+)
+# 对齐 cuda：TP=2 时开 sequence-parallel（A-006）
+if [ "${ENABLE_SEQUENCE_PARALLEL}" = "1" ] && [ "${TP}" -gt 1 ]; then
+    ADD_NETWORK_SIZE_ARGS+=(
+        --sequence-parallel
+    )
+fi
+# 未启用（见 docs/musa_cuda_adaptation_issues.md）:
+#   --pipeline-model-parallel-layout / overlap / delay-wgrad / flex+deepep /
+#   --moe-router-fusion / --moe-shared-expert-compute-before-router /
+#   --enable-experimental（A-013：无 flex/deepep 时不装样子）
+
+if [ "${NNODES}" -lt 128 ]; then
+    echo "WARNING: musa_pretrain_ws128.sh 预期 NNODES>=128，当前 NNODES=${NNODES}" >&2
+fi
+
+if [ "$MTP_LAYERS" -gt 0 ]; then
+    ADD_NETWORK_SIZE_ARGS=(
+        ${ADD_NETWORK_SIZE_ARGS[@]}
+        --mtp-num-layers ${MTP_LAYERS}
+        --mtp-loss-scaling-factor ${MTP_LOSS}
+    )
+fi
+
+# ---------------------------------------------------------------------------
+# DATA PROCESS（对齐 cuda_pretrain.sh 加权 blend 逻辑）
+# 原 cuda: DATA_PATH=/mnt/workspace/data/merged，文件名如 *-merge.bin
+# 现: 本地 DATA_PATH 为 tkn_ds_the_pile/*_text_document.bin，文件名不匹配 STAGE1_DATA
+#     → 先走 cuda 同名匹配；若无匹配则 fallback 等权使用全部 *.bin
+# ---------------------------------------------------------------------------
+declare -A STAGE1_DATA=(
+    ["2-3-merge.bin"]=86.683163068
+    ["3-4-merge.bin"]=59.885228928
+    ["CC-MAIN-2021-04-merge.bin"]=16.826519427
+    ["CC-MAIN-2021-10-merge.bin"]=13.837581715
+    ["CC-MAIN-2021-17-merge.bin"]=14.980002313
+    ["CC-MAIN-2021-21-merge.bin"]=9.779054111
+    ["CC-MAIN-2021-25-merge.bin"]=12.707104188
+    ["CC-MAIN-2021-31-merge.bin"]=18.312108025
+    ["CC-MAIN-2021-39-merge.bin"]=16.28938315
+    ["CC-MAIN-2021-43-merge.bin"]=18.801128405
+    ["CC-MAIN-2021-49-merge.bin"]=12.684432821
+    ["CC-MAIN-2022-05-merge.bin"]=16.324092216
+    ["CC-MAIN-2022-21-merge.bin"]=20.576187199
+    ["CC-MAIN-2022-27-merge.bin"]=13.207847354
+    ["CC-MAIN-2022-33-merge.bin"]=9.65958263
+    ["CC-MAIN-2023-06-merge.bin"]=19.724194067
+    ["CC-MAIN-2023-14-merge.bin"]=16.33230536
+    ["CC-MAIN-2023-23-merge.bin"]=21.760590368
+    ["CC-MAIN-2024-22-merge.bin"]=14.299276047
+    ["CC-MAIN-2024-26-merge.bin"]=13.019718751
+    ["CC-MAIN-2024-30-merge.bin"]=12.693607986
+    ["CC-MAIN-2024-33-merge.bin"]=10.86458841
+    ["CC-MAIN-2024-38-merge.bin"]=13.383161961
+    ["CC-MAIN-2024-42-merge.bin"]=11.09886149
+    ["CC-MAIN-2024-46-merge.bin"]=12.230566164
+    ["CC-MAIN-2024-51-merge.bin"]=12.740120855
+)
+FILE_NAMES=()
+while IFS= read -r file; do
+    FILE_NAMES+=("${file}")
+done < <(find "$DATA_PATH" -type f -name "*.bin" 2>/dev/null | sort)
+DATA_PATHS=()
+for file_name in "${FILE_NAMES[@]}"; do
+    file_path=$file_name
+    file_name_only="${file_path#"$DATA_PATH/"}"
+    if [[ -v STAGE1_DATA["$file_name_only"] ]]; then
+        weight=${STAGE1_DATA["$file_name_only"]}
+    else
+        continue
+    fi
+    length=${#file_path}
+    DATA_PATHS+=("${weight} ${file_path:0:$((length - 4))}")
+done
+if [ ${#DATA_PATHS[@]} -eq 0 ]; then
+    # fallback: 本地验证数据无 merge.bin 命名，等权使用可用分片
+    # 原 cuda STAGE1_DATA 中所有 merge.bin 均有配套 idx；本地 02_text_document 缺 idx，需过滤
+    echo "NOTE: STAGE1_DATA 无匹配文件，fallback 等权加载 ${DATA_PATH} 下 bin+idx 成对分片" >&2
+    for file_name in "${FILE_NAMES[@]}"; do
+        file_path=$file_name
+        length=${#file_path}
+        prefix="${file_path:0:$((length - 4))}"
+        idx_path="${prefix}.idx"
+        if [ -f "${idx_path}" ]; then
+            DATA_PATHS+=("1.0 ${prefix}")
+        fi
+    done
+fi
+if [ ${#DATA_PATHS[@]} -eq 0 ]; then
+    echo "ERROR: 未找到可用数据，请检查 DATA_PATH=${DATA_PATH}" >&2
+    exit 1
+fi
+DATA_PATH_ARGUMENT=$(printf "%s " "${DATA_PATHS[@]}")
+echo "DATA_PATH_ARGUMENT=${DATA_PATH_ARGUMENT}"
+
+if [ ! -d "$SAVE_PATH" ]; then
+  mkdir -p "$SAVE_PATH"
+fi
+
+SAVE_PATH=$SAVE_PATH/$RUN_NAME
+LOG_OUTPUT=$LOG_OUTPUT/$RUN_NAME
+mkdir -p $LOG_OUTPUT
+
+# ---------------------------------------------------------------------------
+# 分布式 / 训练 / 数据 / 日志参数（对齐 cuda_pretrain.sh）
+# ---------------------------------------------------------------------------
+DISTRIBUTED_ARGS=(
+    --distributed-timeout-minutes 60
+    --tensor-model-parallel-size ${TP}
+    --pipeline-model-parallel-size ${PP}
+    --context-parallel-size ${CP}
+    --expert-tensor-parallel-size 1
+    --expert-model-parallel-size ${EP}
+    --use-distributed-optimizer
+)
+
+TRAINING_ARGS=(
+    --use-mcore-models
+    --micro-batch-size ${MICRO_BATCH}
+    --global-batch-size ${GLOBAL_BATCH}
+    --train-iters ${TRAINING_STEPS}
+    --no-check-for-nan-in-loss-and-grad
+    --max-position-embeddings ${SEQ_LENGTH}
+    --lr-decay-iters ${DECAY_STEPS}
+    --lr-warmup-iters ${WARMUP_STEPS}
+    --lr-warmup-init ${LR_WARMUP_INIT}
+    --lr ${LR}
+    --min-lr ${LR_MIN}
+    --lr-decay-style ${DECAY_STYLE}
+    --adam-beta1 ${ADAM_BETA1}
+    --adam-beta2 ${ADAM_BETA2}
+    --moe-aux-loss-coeff ${LB_RATE}
+    --moe-router-bias-update-rate ${RB_RATE}
+    --no-gradient-accumulation-fusion                          # MUSA patch 反向梯度数量不匹配（expected 9 got 8）
+    --eval-iters 0
+    --eval-interval ${SAVE_INTERVAL}
+    --save ${SAVE_PATH}
+    --save-interval ${SAVE_INTERVAL}
+    --init-method-std ${INIT_STD}
+)
+
+DATA_ARGS=(
+    --seq-length ${SEQ_LENGTH}
+    --data-cache-path ${SAVE_PATH}/cache
+    --tokenizer-type HuggingFaceTokenizer
+    --tokenizer-model ${TOKENIZER_PATH}
+    --data-path ${DATA_PATH_ARGUMENT}
+    --split 100,0,0
+    --no-mmap-bin-files
+    --no-create-attention-mask-in-dataloader
+    --num-workers 6                          # B2: 对齐 cuda（原 simu 为 2）
+)
+
+LOGGING_ARGS=(
+    # 原 cuda: 以下 tensorboard 相关参数全开
+    # 现: 关闭 tensorboard — musa_patch training_log 写入标量时维度报错 (size:2 vs 0-dim)
+    --log-throughput
+    --log-interval 1
+    --logging-level 40
+    --bf16
+)
+if [ "${ENABLE_TENSORBOARD:-0}" = "1" ]; then
+    # 注意: --log-memory-to-tensorboard 在 MUSA 上会 KeyError('reserved_bytes.all.current')，勿开
+    LOGGING_ARGS+=(
+        --log-timers-to-tensorboard
+        --log-num-zeros-in-grad
+        --log-params-norm
+        --log-validation-ppl-to-tensorboard
+        --tensorboard-dir ${SAVE_PATH}/tensorboard
+        --tensorboard-log-interval 1
+        --moe-per-layer-logging
+    )
+fi
+
+FILE=${SAVE_PATH}/latest_checkpointed_iteration.txt
+if [ -f "$FILE" ]; then
+    INPUT=(--load ${SAVE_PATH})
+else
+    INPUT=()
+fi
+
+echo "========================================"
+echo "MUSA ws128 正式交付训练 (rank ${NODE_RANK}/${NNODES})"
+echo "  LOCAL_IP   : ${LOCAL_IP}"
+echo "  MASTER     : ${MASTER_ADDR}:${MASTER_PORT}"
+echo "  WORLD_SIZE : ${WORLD_SIZE}"
+echo "  ENTRY      : ${PRETRAIN_SCRIPT}  (via ${LAUNCHER})"
+echo "  TP/PP/EP   : ${TP}/${PP}/${EP}"
+echo "  SEQ_PARALLEL: ${ENABLE_SEQUENCE_PARALLEL}"
+echo "  SEQ_LENGTH : ${SEQ_LENGTH}"
+echo "  GLOBAL_BS  : ${GLOBAL_BATCH}"
+echo "  TRAIN_ITERS: ${TRAINING_STEPS}"
+echo "  RUN_NAME   : ${RUN_NAME}"
+echo "  LOG        : ${LOG_OUTPUT}/output_rank${NODE_RANK}.log"
+echo "========================================"
+
+# 原 cuda: nohup torchrun ... pretrain_gpt.py
+# 现: 经 LAUNCHER 注入 MUSA patch；FOREGROUND=1 可前台调试
+if [ "${FOREGROUND:-0}" = "1" ]; then
+    torchrun --nproc_per_node=$GPUS_PER_NODE --nnodes=$NNODES --node_rank=$NODE_RANK \
+        --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT ${LAUNCHER} \
+        ${DISTRIBUTED_ARGS[@]} \
+        ${TRAINING_ARGS[@]} \
+        ${DATA_ARGS[@]} \
+        ${ADD_NETWORK_SIZE_ARGS[@]} \
+        ${LOGGING_ARGS[@]} \
+        ${INPUT[@]} 2>&1 | tee $LOG_OUTPUT/output_rank${NODE_RANK}.log
+else
+    nohup torchrun --nproc_per_node=$GPUS_PER_NODE --nnodes=$NNODES --node_rank=$NODE_RANK \
+        --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT ${LAUNCHER} \
+        ${DISTRIBUTED_ARGS[@]} \
+        ${TRAINING_ARGS[@]} \
+        ${DATA_ARGS[@]} \
+        ${ADD_NETWORK_SIZE_ARGS[@]} \
+        ${LOGGING_ARGS[@]} \
+        ${INPUT[@]} > $LOG_OUTPUT/output_rank${NODE_RANK}.log 2>&1 &
+    echo "已后台启动 torchrun, PID=$!, 日志: $LOG_OUTPUT/output_rank${NODE_RANK}.log"
+fi
