@@ -1,5 +1,14 @@
 export LOG_NAME=ws128_$(date +%Y%m%d)   # 每次新 run 换名，避免 cache/ckpt 冲突
 
+# Profiler（参考 telechat3/105B run_pretrain_telechatv3_105B_musa.sh；需要抓 profile 时取消注释）
+# export ENABLE_PROFILER=1          # 总开关：同时启用 MUSA profiler 环境变量 + Megatron --profile
+# export PROFILER_FREQ=4
+# export PROFILER_WARMUP_STEPS=3
+# export PROFILER_PROFILE_MEMORY=1
+# export MUSA_LAUNCH_BLOCKING=1    # 显著拖慢训练，仅精确定位 kernel 时再开
+# export PROFILE_STEP_START=4      # Megatron --profile-step-start（默认 4）
+# export PROFILE_STEP_END=6        # Megatron --profile-step-end（默认 6）
+
 bash auto_fault_manager.sh \
   --hostfile ../hostfile.runtime.128 \
   --worldsize 128 \

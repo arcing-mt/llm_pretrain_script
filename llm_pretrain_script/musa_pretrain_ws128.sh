@@ -408,6 +408,25 @@ if [ "${ENABLE_TENSORBOARD:-0}" = "1" ]; then
     )
 fi
 
+# ---------------------------------------------------------------------------
+# Profiler（参考 telechat3/105B run_pretrain_telechatv3_105B_musa.sh）
+# ENABLE_PROFILER=1 时：导出 MUSA profiler 环境变量 + Megatron --profile 区间
+# 注意：profile 区间内每 step 都会 dump trace，正式训练勿长开
+# ---------------------------------------------------------------------------
+PROFILE_ARGS=()
+if [ "${ENABLE_PROFILER:-0}" = "1" ]; then
+    export ENABLE_PROFILER
+    export PROFILER_FREQ=${PROFILER_FREQ:-4}
+    export PROFILER_WARMUP_STEPS=${PROFILER_WARMUP_STEPS:-3}
+    export PROFILER_PROFILE_MEMORY=${PROFILER_PROFILE_MEMORY:-1}
+    # MUSA_LAUNCH_BLOCKING 由入口显式 export 才生效（显著拖慢，默认不开）
+    PROFILE_ARGS+=(
+        --profile
+        --profile-step-start ${PROFILE_STEP_START:-4}
+        --profile-step-end ${PROFILE_STEP_END:-6}
+    )
+fi
+
 FILE=${SAVE_PATH}/latest_checkpointed_iteration.txt
 if [ -f "$FILE" ]; then
     INPUT=(--load ${SAVE_PATH})
@@ -426,6 +445,7 @@ echo "  SEQ_PARALLEL: ${ENABLE_SEQUENCE_PARALLEL}"
 echo "  SEQ_LENGTH : ${SEQ_LENGTH}"
 echo "  GLOBAL_BS  : ${GLOBAL_BATCH}"
 echo "  TRAIN_ITERS: ${TRAINING_STEPS}"
+echo "  PROFILER   : ${ENABLE_PROFILER:-0}"
 echo "  RUN_NAME   : ${RUN_NAME}"
 echo "  LOG        : ${LOG_OUTPUT}/output_rank${NODE_RANK}.log"
 echo "========================================"
@@ -440,6 +460,7 @@ if [ "${FOREGROUND:-0}" = "1" ]; then
         ${DATA_ARGS[@]} \
         ${ADD_NETWORK_SIZE_ARGS[@]} \
         ${LOGGING_ARGS[@]} \
+        ${PROFILE_ARGS[@]} \
         ${INPUT[@]} 2>&1 | tee $LOG_OUTPUT/output_rank${NODE_RANK}.log
 else
     nohup torchrun --nproc_per_node=$GPUS_PER_NODE --nnodes=$NNODES --node_rank=$NODE_RANK \
@@ -449,6 +470,7 @@ else
         ${DATA_ARGS[@]} \
         ${ADD_NETWORK_SIZE_ARGS[@]} \
         ${LOGGING_ARGS[@]} \
+        ${PROFILE_ARGS[@]} \
         ${INPUT[@]} > $LOG_OUTPUT/output_rank${NODE_RANK}.log 2>&1 &
     echo "已后台启动 torchrun, PID=$!, 日志: $LOG_OUTPUT/output_rank${NODE_RANK}.log"
 fi
