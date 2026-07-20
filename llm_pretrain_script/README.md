@@ -76,6 +76,17 @@ export PROFILE_STEP_END=6         # 可选,Megatron --profile-step-end,默认 6
 - 每节点入口脚本无需改动,环境变量随 `exec` 自然传递。
 - 注意:profile 区间内每 step 都会 dump trace,正式长训勿长开;`musa_pretrain_ws2.sh` 双机验证版暂未接入。
 
+## DeepEP-ACE
+
+参考 `telechat3/105B/run_pretrain_telechatv3_105B_musa.sh`(L49 `export USE_DEEPEP_ACE=1`)接入 DeepEP-ACE 优化,**默认开启**。
+
+`USE_DEEPEP_ACE` 环境变量只在 flex dispatcher + DeepEP 的 `fused_a2a` 路径生效(musa_patch 按需加载 `deepep_ace` 模块,DeepEP Buffer 以 `use_ace=True` 创建),因此接入时同步做了 dispatcher 切换,`musa_pretrain_ws128.sh` 中按开关分支:
+
+- `USE_DEEPEP_ACE=1`(默认):`--moe-token-dispatcher-type flex --moe-enable-deepep --moe-token-drop-policy probs --enable-experimental`,并默认 `MCCL_CROSS_NIC=1`(对齐参考脚本 flex+deepep 链路)。
+- `USE_DEEPEP_ACE=0`:回退原 `--moe-token-dispatcher-type alltoall` 路径(改动前行为)。回退开关在 `cluster/dist_train_caizhi.sh` 顶部(默认注释),经 `dist_run_megatron.sh` SSH 白名单透传。
+
+注意:参考脚本还开了 `--moe-router-fusion`,本仓库暂未接入(见 `docs/musa_cuda_adaptation_issues.md` 未启用清单);首次切 flex+deepep 建议先小步数验证再进长训。
+
 关键路径(pod 内):
 
 - 训练输出/ckpt:`/home/jd/wangkang/llm_pretrain/outputs/${LOG_NAME}`

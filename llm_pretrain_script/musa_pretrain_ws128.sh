@@ -100,7 +100,7 @@ export NVTE_DEBUG_LEVEL=${NVTE_DEBUG_LEVEL:-0}                         # 原: 2
 # 原 cuda: NVTE_NORM_*_USE_CUDNN / CUDNN_LOG* — MUSA 无 cuDNN，省略
 
 export USE_MUSA_MOE=${USE_MUSA_MOE:-1}                                 # 原 cuda 无，musa_pretrain 新增
-export USE_DEEPEP_ACE=${USE_DEEPEP_ACE:-0}                             # 原 musa_pretrain: 1；alltoall 模式下关闭
+export USE_DEEPEP_ACE=${USE_DEEPEP_ACE:-1}                             # 对齐 telechat3/105B 参考脚本；=1 时 dispatcher 切 flex+deepep（见下方分支），=0 回退 alltoall
 export USE_RECOMPUTE_VARIANCE=${USE_RECOMPUTE_VARIANCE:-0}
 export ENABLE_D2H_IN_PERMUTATION=${ENABLE_D2H_IN_PERMUTATION:-0}
 export NO_LOSS_REDUCE=${NO_LOSS_REDUCE:-1}                             # 原 cuda: 0；MUSA patch loss 上报格式不兼容标量写入
@@ -232,9 +232,25 @@ ADD_NETWORK_SIZE_ARGS=(
     --cross-entropy-loss-fusion
     --cross-entropy-fusion-impl native
     --moe-permute-fusion
-    --moe-token-dispatcher-type alltoall
     --moe-router-force-load-balancing
 )
+# MoE dispatcher（对齐 telechat3/105B run_pretrain_telechatv3_105B_musa.sh）:
+# USE_DEEPEP_ACE=1 → flex + deepep + ACE（musa_patch deepep_ace，fused_a2a Buffer use_ace=True）
+# USE_DEEPEP_ACE=0 → 回退原 alltoall 路径
+if [ "${USE_DEEPEP_ACE}" = "1" ]; then
+    ADD_NETWORK_SIZE_ARGS+=(
+        --moe-token-dispatcher-type flex
+        --moe-enable-deepep
+        --moe-token-drop-policy probs
+        --enable-experimental
+    )
+    # 参考脚本 flex+deepep 时 MCCL_CROSS_NIC=1（非 deepep 链路默认 0）
+    export MCCL_CROSS_NIC=${MCCL_CROSS_NIC:-1}
+else
+    ADD_NETWORK_SIZE_ARGS+=(
+        --moe-token-dispatcher-type alltoall
+    )
+fi
 # 对齐 cuda：TP=2 时开 sequence-parallel（A-006）
 if [ "${ENABLE_SEQUENCE_PARALLEL}" = "1" ] && [ "${TP}" -gt 1 ]; then
     ADD_NETWORK_SIZE_ARGS+=(
@@ -242,9 +258,9 @@ if [ "${ENABLE_SEQUENCE_PARALLEL}" = "1" ] && [ "${TP}" -gt 1 ]; then
     )
 fi
 # 未启用（见 docs/musa_cuda_adaptation_issues.md）:
-#   --pipeline-model-parallel-layout / overlap / delay-wgrad / flex+deepep /
-#   --moe-router-fusion / --moe-shared-expert-compute-before-router /
-#   --enable-experimental（A-013：无 flex/deepep 时不装样子）
+#   --pipeline-model-parallel-layout / overlap / delay-wgrad /
+#   --moe-router-fusion / --moe-shared-expert-compute-before-router
+# flex+deepep+ACE / --enable-experimental 已随 USE_DEEPEP_ACE=1 接入（见上方 dispatcher 分支）
 
 if [ "${NNODES}" -lt 128 ]; then
     echo "WARNING: musa_pretrain_ws128.sh 预期 NNODES>=128，当前 NNODES=${NNODES}" >&2
@@ -446,6 +462,7 @@ echo "  SEQ_LENGTH : ${SEQ_LENGTH}"
 echo "  GLOBAL_BS  : ${GLOBAL_BATCH}"
 echo "  TRAIN_ITERS: ${TRAINING_STEPS}"
 echo "  PROFILER   : ${ENABLE_PROFILER:-0}"
+echo "  DEEPEP_ACE : ${USE_DEEPEP_ACE}"
 echo "  RUN_NAME   : ${RUN_NAME}"
 echo "  LOG        : ${LOG_OUTPUT}/output_rank${NODE_RANK}.log"
 echo "========================================"
