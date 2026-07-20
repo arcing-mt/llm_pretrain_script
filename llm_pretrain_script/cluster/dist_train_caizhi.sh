@@ -12,6 +12,9 @@ export LOG_NAME=ws128_$(date +%Y%m%d)   # 每次新 run 换名，避免 cache/ck
 # DeepEP-ACE（参考 telechat3/105B 脚本 L49；musa_pretrain_ws128.sh 默认已开）
 # export USE_DEEPEP_ACE=0          # 置 0 回退 alltoall dispatcher（关闭 flex+deepep+ACE）
 
+# GroupGEMM（对齐 examples 各模型脚本 --moe-grouped-gemm；musa_pretrain_ws128.sh 默认已开）
+# export MOE_GROUPED_GEMM=0        # 置 0 去掉 --moe-grouped-gemm，回退 SequentialMLP（仅排查问题用）
+
 bash auto_fault_manager.sh \
   --hostfile ../hostfile.runtime.128 \
   --worldsize 128 \

@@ -87,6 +87,15 @@ export PROFILE_STEP_END=6         # 可选,Megatron --profile-step-end,默认 6
 
 注意:参考脚本还开了 `--moe-router-fusion`,本仓库暂未接入(见 `docs/musa_cuda_adaptation_issues.md` 未启用清单);首次切 flex+deepep 建议先小步数验证再进长训。
 
+## GroupGEMM
+
+`megatron-lm-musa-patch/examples` 各模型脚本使能 group_gemm 的方式即 Megatron 参数 `--moe-grouped-gemm`(patch 侧无需额外模块)。本仓库 `musa_pretrain_ws128.sh` 原本写死开启,现改为环境变量 `MOE_GROUPED_GEMM` 控制:
+
+- `MOE_GROUPED_GEMM=1`(默认,与原行为一致):追加 `--moe-grouped-gemm`,专家计算走 GroupedMLP。
+- `MOE_GROUPED_GEMM=0`:去掉该参数,回退 SequentialMLP(逐专家循环,性能差,仅排查 grouped gemm 相关问题时用)。
+
+回退开关在 `cluster/dist_train_caizhi.sh` 顶部(默认注释),经 `dist_run_megatron.sh` SSH 白名单透传;启动横幅打印 `GROUP_GEMM: 0/1`。
+
 关键路径(pod 内):
 
 - 训练输出/ckpt:`/home/jd/wangkang/llm_pretrain/outputs/${LOG_NAME}`

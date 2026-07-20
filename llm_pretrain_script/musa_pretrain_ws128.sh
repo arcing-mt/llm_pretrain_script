@@ -211,7 +211,6 @@ ADD_NETWORK_SIZE_ARGS=(
     --moe-router-load-balancing-type seq_aux_loss
     --moe-router-topk 8
     --moe-router-pre-softmax
-    --moe-grouped-gemm
     --moe-router-group-topk 4
     --moe-router-num-groups 8
     --moe-router-topk-scaling-factor 2.5
@@ -234,6 +233,15 @@ ADD_NETWORK_SIZE_ARGS=(
     --moe-permute-fusion
     --moe-router-force-load-balancing
 )
+# GroupGEMM（对齐 examples 各模型脚本的使能方式，即 --moe-grouped-gemm 参数）:
+# MOE_GROUPED_GEMM=1（默认，原行为）→ 专家计算走 GroupedMLP
+# MOE_GROUPED_GEMM=0 → 去掉该参数，回退 SequentialMLP（逐专家循环，仅排查问题用）
+export MOE_GROUPED_GEMM=${MOE_GROUPED_GEMM:-1}
+if [ "${MOE_GROUPED_GEMM}" = "1" ]; then
+    ADD_NETWORK_SIZE_ARGS+=(
+        --moe-grouped-gemm
+    )
+fi
 # MoE dispatcher（对齐 telechat3/105B run_pretrain_telechatv3_105B_musa.sh）:
 # USE_DEEPEP_ACE=1 → flex + deepep + ACE（musa_patch deepep_ace，fused_a2a Buffer use_ace=True）
 # USE_DEEPEP_ACE=0 → 回退原 alltoall 路径
@@ -463,6 +471,7 @@ echo "  GLOBAL_BS  : ${GLOBAL_BATCH}"
 echo "  TRAIN_ITERS: ${TRAINING_STEPS}"
 echo "  PROFILER   : ${ENABLE_PROFILER:-0}"
 echo "  DEEPEP_ACE : ${USE_DEEPEP_ACE}"
+echo "  GROUP_GEMM : ${MOE_GROUPED_GEMM}"
 echo "  RUN_NAME   : ${RUN_NAME}"
 echo "  LOG        : ${LOG_OUTPUT}/output_rank${NODE_RANK}.log"
 echo "========================================"
