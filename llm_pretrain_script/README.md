@@ -52,6 +52,50 @@ bash dist_train_caizhi.sh
 bash stop_train_caizhi.sh
 ```
 
+## Profiler
+
+参考 `telechat_train/megatron-lm-musa-patch/examples/telechat3/105B/run_pretrain_telechatv3_105B_musa.sh` 的做法,支持一键开启 profiler。默认全部关闭,行为与未改动前一致。
+
+开启方式:取消 `cluster/dist_train_caizhi.sh` 顶部对应注释后正常启动:
+
+```bash
+export ENABLE_PROFILER=1          # 总开关:导出 MUSA profiler 环境变量 + Megatron --profile
+export PROFILER_FREQ=4            # 可选,默认 4
+export PROFILER_WARMUP_STEPS=3    # 可选,默认 3
+export PROFILER_PROFILE_MEMORY=1  # 可选,默认 1
+export MUSA_LAUNCH_BLOCKING=1     # 可选,显著拖慢训练,仅精确定位 kernel 时开
+export PROFILE_STEP_START=4       # 可选,Megatron --profile-step-start,默认 4
+export PROFILE_STEP_END=6         # 可选,Megatron --profile-step-end,默认 6
+```
+
+实现要点:
+
+- `cluster/dist_train_caizhi.sh`:入口处集中放置上述开关(默认注释)。
+- `cluster/dist_run_megatron.sh`:SSH 分发只透传白名单环境变量,已把 7 个 profiler 变量加入捕获与透传列表。
+- `musa_pretrain_ws128.sh`:`ENABLE_PROFILER=1` 时导出 profiler 环境变量,并向 torchrun 追加 `--profile --profile-step-start/--profile-step-end`;启动横幅打印 `PROFILER: 0/1`。
+- 每节点入口脚本无需改动,环境变量随 `exec` 自然传递。
+- 注意:profile 区间内每 step 都会 dump trace,正式长训勿长开;`musa_pretrain_ws2.sh` 双机验证版暂未接入。
+
+## DeepEP-ACE
+
+参考 `telechat3/105B/run_pretrain_telechatv3_105B_musa.sh`(L49 `export USE_DEEPEP_ACE=1`)接入 DeepEP-ACE 优化,**默认开启**。
+
+`USE_DEEPEP_ACE` 环境变量只在 flex dispatcher + DeepEP 的 `fused_a2a` 路径生效(musa_patch 按需加载 `deepep_ace` 模块,DeepEP Buffer 以 `use_ace=True` 创建),因此接入时同步做了 dispatcher 切换,`musa_pretrain_ws128.sh` 中按开关分支:
+
+- `USE_DEEPEP_ACE=1`(默认):`--moe-token-dispatcher-type flex --moe-enable-deepep --moe-token-drop-policy probs --enable-experimental`,并默认 `MCCL_CROSS_NIC=1`(对齐参考脚本 flex+deepep 链路)。
+- `USE_DEEPEP_ACE=0`:回退原 `--moe-token-dispatcher-type alltoall` 路径(改动前行为)。回退开关在 `cluster/dist_train_caizhi.sh` 顶部(默认注释),经 `dist_run_megatron.sh` SSH 白名单透传。
+
+注意:参考脚本还开了 `--moe-router-fusion`,本仓库暂未接入(见 `docs/musa_cuda_adaptation_issues.md` 未启用清单);首次切 flex+deepep 建议先小步数验证再进长训。
+
+## GroupGEMM
+
+`megatron-lm-musa-patch/examples` 各模型脚本使能 group_gemm 的方式即 Megatron 参数 `--moe-grouped-gemm`(patch 侧无需额外模块)。本仓库 `musa_pretrain_ws128.sh` 原本写死开启,现改为环境变量 `MOE_GROUPED_GEMM` 控制:
+
+- `MOE_GROUPED_GEMM=1`(默认,与原行为一致):追加 `--moe-grouped-gemm`,专家计算走 GroupedMLP。
+- `MOE_GROUPED_GEMM=0`:去掉该参数,回退 SequentialMLP(逐专家循环,性能差,仅排查 grouped gemm 相关问题时用)。
+
+回退开关在 `cluster/dist_train_caizhi.sh` 顶部(默认注释),经 `dist_run_megatron.sh` SSH 白名单透传;启动横幅打印 `GROUP_GEMM: 0/1`。
+
 关键路径(pod 内):
 
 - 训练输出/ckpt:`/home/jd/wangkang/llm_pretrain/outputs/${LOG_NAME}`

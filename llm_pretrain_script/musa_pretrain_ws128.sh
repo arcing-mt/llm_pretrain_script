@@ -100,7 +100,7 @@ export NVTE_DEBUG_LEVEL=${NVTE_DEBUG_LEVEL:-0}                         # 原: 2
 # 原 cuda: NVTE_NORM_*_USE_CUDNN / CUDNN_LOG* — MUSA 无 cuDNN，省略
 
 export USE_MUSA_MOE=${USE_MUSA_MOE:-1}                                 # 原 cuda 无，musa_pretrain 新增
-export USE_DEEPEP_ACE=${USE_DEEPEP_ACE:-0}                             # 原 musa_pretrain: 1；alltoall 模式下关闭
+export USE_DEEPEP_ACE=${USE_DEEPEP_ACE:-1}                             # 对齐 telechat3/105B 参考脚本；=1 时 dispatcher 切 flex+deepep（见下方分支），=0 回退 alltoall
 export USE_RECOMPUTE_VARIANCE=${USE_RECOMPUTE_VARIANCE:-0}
 export ENABLE_D2H_IN_PERMUTATION=${ENABLE_D2H_IN_PERMUTATION:-0}
 export NO_LOSS_REDUCE=${NO_LOSS_REDUCE:-1}                             # 原 cuda: 0；MUSA patch loss 上报格式不兼容标量写入
@@ -211,7 +211,6 @@ ADD_NETWORK_SIZE_ARGS=(
     --moe-router-load-balancing-type seq_aux_loss
     --moe-router-topk 8
     --moe-router-pre-softmax
-    --moe-grouped-gemm
     --moe-router-group-topk 4
     --moe-router-num-groups 8
     --moe-router-topk-scaling-factor 2.5
@@ -232,9 +231,34 @@ ADD_NETWORK_SIZE_ARGS=(
     --cross-entropy-loss-fusion
     --cross-entropy-fusion-impl native
     --moe-permute-fusion
-    --moe-token-dispatcher-type alltoall
     --moe-router-force-load-balancing
 )
+# GroupGEMM（对齐 examples 各模型脚本的使能方式，即 --moe-grouped-gemm 参数）:
+# MOE_GROUPED_GEMM=1（默认，原行为）→ 专家计算走 GroupedMLP
+# MOE_GROUPED_GEMM=0 → 去掉该参数，回退 SequentialMLP（逐专家循环，仅排查问题用）
+export MOE_GROUPED_GEMM=${MOE_GROUPED_GEMM:-1}
+if [ "${MOE_GROUPED_GEMM}" = "1" ]; then
+    ADD_NETWORK_SIZE_ARGS+=(
+        --moe-grouped-gemm
+    )
+fi
+# MoE dispatcher（对齐 telechat3/105B run_pretrain_telechatv3_105B_musa.sh）:
+# USE_DEEPEP_ACE=1 → flex + deepep + ACE（musa_patch deepep_ace，fused_a2a Buffer use_ace=True）
+# USE_DEEPEP_ACE=0 → 回退原 alltoall 路径
+if [ "${USE_DEEPEP_ACE}" = "1" ]; then
+    ADD_NETWORK_SIZE_ARGS+=(
+        --moe-token-dispatcher-type flex
+        --moe-enable-deepep
+        --moe-token-drop-policy probs
+        --enable-experimental
+    )
+    # 参考脚本 flex+deepep 时 MCCL_CROSS_NIC=1（非 deepep 链路默认 0）
+    export MCCL_CROSS_NIC=${MCCL_CROSS_NIC:-1}
+else
+    ADD_NETWORK_SIZE_ARGS+=(
+        --moe-token-dispatcher-type alltoall
+    )
+fi
 # 对齐 cuda：TP=2 时开 sequence-parallel（A-006）
 if [ "${ENABLE_SEQUENCE_PARALLEL}" = "1" ] && [ "${TP}" -gt 1 ]; then
     ADD_NETWORK_SIZE_ARGS+=(
@@ -242,9 +266,9 @@ if [ "${ENABLE_SEQUENCE_PARALLEL}" = "1" ] && [ "${TP}" -gt 1 ]; then
     )
 fi
 # 未启用（见 docs/musa_cuda_adaptation_issues.md）:
-#   --pipeline-model-parallel-layout / overlap / delay-wgrad / flex+deepep /
-#   --moe-router-fusion / --moe-shared-expert-compute-before-router /
-#   --enable-experimental（A-013：无 flex/deepep 时不装样子）
+#   --pipeline-model-parallel-layout / overlap / delay-wgrad /
+#   --moe-router-fusion / --moe-shared-expert-compute-before-router
+# flex+deepep+ACE / --enable-experimental 已随 USE_DEEPEP_ACE=1 接入（见上方 dispatcher 分支）
 
 if [ "${NNODES}" -lt 128 ]; then
     echo "WARNING: musa_pretrain_ws128.sh 预期 NNODES>=128，当前 NNODES=${NNODES}" >&2
@@ -408,6 +432,25 @@ if [ "${ENABLE_TENSORBOARD:-0}" = "1" ]; then
     )
 fi
 
+# ---------------------------------------------------------------------------
+# Profiler（参考 telechat3/105B run_pretrain_telechatv3_105B_musa.sh）
+# ENABLE_PROFILER=1 时：导出 MUSA profiler 环境变量 + Megatron --profile 区间
+# 注意：profile 区间内每 step 都会 dump trace，正式训练勿长开
+# ---------------------------------------------------------------------------
+PROFILE_ARGS=()
+if [ "${ENABLE_PROFILER:-0}" = "1" ]; then
+    export ENABLE_PROFILER
+    export PROFILER_FREQ=${PROFILER_FREQ:-4}
+    export PROFILER_WARMUP_STEPS=${PROFILER_WARMUP_STEPS:-3}
+    export PROFILER_PROFILE_MEMORY=${PROFILER_PROFILE_MEMORY:-1}
+    # MUSA_LAUNCH_BLOCKING 由入口显式 export 才生效（显著拖慢，默认不开）
+    PROFILE_ARGS+=(
+        --profile
+        --profile-step-start ${PROFILE_STEP_START:-4}
+        --profile-step-end ${PROFILE_STEP_END:-6}
+    )
+fi
+
 FILE=${SAVE_PATH}/latest_checkpointed_iteration.txt
 if [ -f "$FILE" ]; then
     INPUT=(--load ${SAVE_PATH})
@@ -426,6 +469,9 @@ echo "  SEQ_PARALLEL: ${ENABLE_SEQUENCE_PARALLEL}"
 echo "  SEQ_LENGTH : ${SEQ_LENGTH}"
 echo "  GLOBAL_BS  : ${GLOBAL_BATCH}"
 echo "  TRAIN_ITERS: ${TRAINING_STEPS}"
+echo "  PROFILER   : ${ENABLE_PROFILER:-0}"
+echo "  DEEPEP_ACE : ${USE_DEEPEP_ACE}"
+echo "  GROUP_GEMM : ${MOE_GROUPED_GEMM}"
 echo "  RUN_NAME   : ${RUN_NAME}"
 echo "  LOG        : ${LOG_OUTPUT}/output_rank${NODE_RANK}.log"
 echo "========================================"
@@ -440,6 +486,7 @@ if [ "${FOREGROUND:-0}" = "1" ]; then
         ${DATA_ARGS[@]} \
         ${ADD_NETWORK_SIZE_ARGS[@]} \
         ${LOGGING_ARGS[@]} \
+        ${PROFILE_ARGS[@]} \
         ${INPUT[@]} 2>&1 | tee $LOG_OUTPUT/output_rank${NODE_RANK}.log
 else
     nohup torchrun --nproc_per_node=$GPUS_PER_NODE --nnodes=$NNODES --node_rank=$NODE_RANK \
@@ -449,6 +496,7 @@ else
         ${DATA_ARGS[@]} \
         ${ADD_NETWORK_SIZE_ARGS[@]} \
         ${LOGGING_ARGS[@]} \
+        ${PROFILE_ARGS[@]} \
         ${INPUT[@]} > $LOG_OUTPUT/output_rank${NODE_RANK}.log 2>&1 &
     echo "已后台启动 torchrun, PID=$!, 日志: $LOG_OUTPUT/output_rank${NODE_RANK}.log"
 fi
