@@ -251,9 +251,14 @@ fi
 # It is opt-in because every node must have matching mate and mate-mubin packages.
 export MATE_GROUPED_GEMM=${MATE_GROUPED_GEMM:-0}
 export MATE_USE_MAIN_GRAD=${MATE_USE_MAIN_GRAD:-1}
+export MATE_CACHE_MUBIN_DISPATCH=${MATE_CACHE_MUBIN_DISPATCH:-1}
+export MATE_DEFER_DEEPEP_COUNTS=${MATE_DEFER_DEEPEP_COUNTS:-1}
+export MUSA_CPU_AFFINITY=${MUSA_CPU_AFFINITY:-0}
+export MUSA_CPU_AFFINITY_MODE=${MUSA_CPU_AFFINITY_MODE:-mate}
+export MUSA_CPU_AFFINITY_MAP=${MUSA_CPU_AFFINITY_MAP:-}
 export TE_TN_GM6_WGRAD=${TE_TN_GM6_WGRAD:-0}
 export MATE_TN_GM6_WGRAD=${MATE_TN_GM6_WGRAD:-0}
-for flag_name in MATE_GROUPED_GEMM MATE_USE_MAIN_GRAD TE_TN_GM6_WGRAD MATE_TN_GM6_WGRAD; do
+for flag_name in MATE_GROUPED_GEMM MATE_USE_MAIN_GRAD MATE_CACHE_MUBIN_DISPATCH MATE_DEFER_DEEPEP_COUNTS MUSA_CPU_AFFINITY TE_TN_GM6_WGRAD MATE_TN_GM6_WGRAD; do
     flag_value=${!flag_name}
     if [[ "${flag_value}" != "0" && "${flag_value}" != "1" ]]; then
         echo "Error: ${flag_name} must be 0 or 1, got '${flag_value}'" >&2
@@ -527,7 +532,8 @@ echo "  TRAIN_ITERS: ${TRAINING_STEPS}"
 echo "  PROFILER   : ${ENABLE_PROFILER:-0}"
 echo "  DEEPEP_ACE : ${USE_DEEPEP_ACE}"
 echo "  GROUP_GEMM : ${MOE_GROUPED_GEMM}"
-echo "  MATE_FD_TE_W: ${MATE_GROUPED_GEMM} (main_grad=${MATE_USE_MAIN_GRAD})"
+echo "  MATE_FD_TE_W: ${MATE_GROUPED_GEMM} (main_grad=${MATE_USE_MAIN_GRAD}, cache=${MATE_CACHE_MUBIN_DISPATCH}, defer_counts=${MATE_DEFER_DEEPEP_COUNTS})"
+echo "  CPU_AFFINITY: ${MUSA_CPU_AFFINITY} (mode=${MUSA_CPU_AFFINITY_MODE})"
 echo "  TN_GM6_WGRAD: te=${TE_TN_GM6_WGRAD} mate=${MATE_TN_GM6_WGRAD}"
 echo "  RUN_NAME   : ${RUN_NAME}"
 echo "  LOG        : ${LOG_OUTPUT}/output_rank${NODE_RANK}.log"

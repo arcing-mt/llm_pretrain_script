@@ -40,7 +40,14 @@ def parse_cpu_set(spec: str) -> set[int]:
 
 
 def maybe_bind_local_rank_cpu_affinity(stage: str = "early") -> set[int] | None:
-    """Bind this worker according to ``MUSA_CPU_AFFINITY_MAP`` when enabled."""
+    """Bind this worker according to ``MUSA_CPU_AFFINITY_MAP`` when enabled.
+
+    The map contains one CPU set per local rank, separated by semicolons. For
+    example: ``0-7;8-15;16-23;24-31``. The default ``mate`` mode binds only the
+    thread submitting MATE work, after DeepEP has created its communication
+    resources. The experimental ``early`` mode binds before torch is imported,
+    so all subsequently created threads inherit the affinity.
+    """
     if not _env_flag("MUSA_CPU_AFFINITY", "0"):
         return None
 
