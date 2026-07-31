@@ -75,6 +75,13 @@ beta=1。使用 `main_grad` 时，调用方会把 `grad_added_to_main_grad` 标�
 以下是已有 16 机、EP8、24 层测试入口的最小形式；hostfile 应替换为当前确认可用的
 16 机文件：
 
+Router fusion 必须保持开启。训练入口使用仓库内的
+`llm_pretrain_script/pretrain_gpt_musa_routerfusion_launcher.py`，它会先导入
+`musa_patch`，补注册 `--moe-router-fusion`，并把当前 MUSA TE 分支已有的 fused-router
+接口注入 Megatron，以绕过上游只按 TE 版本号判断导致的误禁用。若自定义训练 shell，
+必须同时把 `LAUNCHER` 指向该文件，并在参数中保留 `--moe-router-fusion`；不能退回
+普通 `pretrain_gpt_musa_launcher.py`。
+
 ```bash
 cd /home/jd/haowen.yan/llm_pretrain_script/llm_pretrain_script/cluster
 export LOG_NAME=gm6_ws16_$(date +%Y%m%d_%H%M%S)

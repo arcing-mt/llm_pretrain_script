@@ -115,7 +115,7 @@ export NO_LOSS_REDUCE=${NO_LOSS_REDUCE:-1}                             # 原 cud
 REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 MCORE_PATH=${MCORE_PATH:-${REPO_ROOT}/Megatron-LM}
 PATCH_HOME=${PATCH_HOME:-${REPO_ROOT}/megatron-lm-musa-patch}
-LAUNCHER=${SCRIPT_DIR}/pretrain_gpt_musa_launcher.py
+LAUNCHER=${SCRIPT_DIR}/pretrain_gpt_musa_routerfusion_launcher.py
 PRETRAIN_SCRIPT=${MCORE_PATH}/pretrain_gpt.py
 export MCORE_PATH
 export PRETRAIN_SCRIPT
@@ -232,6 +232,7 @@ ADD_NETWORK_SIZE_ARGS=(
     --cross-entropy-loss-fusion
     --cross-entropy-fusion-impl native
     --moe-permute-fusion
+    --moe-router-fusion
     --moe-router-force-load-balancing
 )
 # GroupGEMM（对齐 examples 各模型脚本的使能方式，即 --moe-grouped-gemm 参数）:
@@ -321,7 +322,7 @@ if [ "${ENABLE_SEQUENCE_PARALLEL}" = "1" ] && [ "${TP}" -gt 1 ]; then
 fi
 # 未启用（见 docs/musa_cuda_adaptation_issues.md）:
 #   --pipeline-model-parallel-layout / overlap / delay-wgrad /
-#   --moe-router-fusion / --moe-shared-expert-compute-before-router
+#   --moe-shared-expert-compute-before-router
 # flex+deepep+ACE / --enable-experimental 已随 USE_DEEPEP_ACE=1 接入（见上方 dispatcher 分支）
 
 if [ "${NNODES}" -lt 128 ]; then
