@@ -109,11 +109,12 @@ export NO_LOSS_REDUCE=${NO_LOSS_REDUCE:-1}                             # 原 cud
 # 代码路径（对齐 cuda_pretrain.sh：固定 MCORE_PATH + pretrain_gpt.py，禁止 env 覆盖）
 # cuda:  MCORE_PATH=/mnt/workspace/jdcloud/Megatron-LM
 #        torchrun ... ${MCORE_PATH}/pretrain_gpt.py
-# musa:  同路径语义固定为容器内 /home/Megatron-LM/pretrain_gpt.py；
+# musa:  默认使用当前仓库内的 Megatron-LM 和 megatron-lm-musa-patch；
 #        仍经 LAUNCHER 先注入 musa_patch（MUSA 必需），再 runpy 到该入口。
 # ---------------------------------------------------------------------------
-MCORE_PATH=/home/Megatron-LM
-PATCH_HOME=/home/megatron-lm-musa-patch
+REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
+MCORE_PATH=${MCORE_PATH:-${REPO_ROOT}/Megatron-LM}
+PATCH_HOME=${PATCH_HOME:-${REPO_ROOT}/megatron-lm-musa-patch}
 LAUNCHER=${SCRIPT_DIR}/pretrain_gpt_musa_launcher.py
 PRETRAIN_SCRIPT=${MCORE_PATH}/pretrain_gpt.py
 export MCORE_PATH
